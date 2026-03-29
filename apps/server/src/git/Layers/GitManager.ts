@@ -902,7 +902,39 @@ export const makeGitManager = Effect.fn("makeGitManager")(function* () {
     }
 
     const baseBranch = yield* resolveBaseBranch(cwd, branch, details.upstreamRef, headContext);
-    const rangeContext = yield* gitCore.readRangeContext(cwd, baseBranch);
+
+    // Fetch the latest base branch from the remote so the range context
+    // reflects only commits not yet merged upstream.  Without this fetch
+    // the local base ref (e.g. "main") may be stale and the diff/log
+    // would include commits from previously merged PRs, causing the
+    // generated PR title and body to repeat old content.
+    const rangeBase = yield* Effect.gen(function* () {
+      const remoteName = headContext.remoteName ?? "origin";
+      const remoteRef = `${remoteName}/${baseBranch}`;
+      yield* gitCore.execute({
+        operation: "runPrStep.fetchBaseBranch",
+        cwd,
+        args: [
+          "fetch",
+          "--quiet",
+          "--no-tags",
+          remoteName,
+          `+refs/heads/${baseBranch}:refs/remotes/${remoteRef}`,
+        ],
+        allowNonZeroExit: true,
+        timeoutMs: 30_000,
+      });
+      // Verify the remote ref exists after fetch; if it does, prefer it.
+      const verifyResult = yield* gitCore.execute({
+        operation: "runPrStep.verifyRemoteRef",
+        cwd,
+        args: ["rev-parse", "--verify", remoteRef],
+        allowNonZeroExit: true,
+      });
+      return verifyResult.code === 0 ? remoteRef : baseBranch;
+    }).pipe(Effect.catch(() => Effect.succeed(baseBranch)));
+
+    const rangeContext = yield* gitCore.readRangeContext(cwd, rangeBase);
 
     const generated = yield* textGeneration.generatePrContent({
       cwd,
